@@ -10,6 +10,7 @@ from attention_utils import *
 
 cross_attn_init()
 # Load the components of Stable Diffusion
+# TODO: pipe_inpaint need 5 channels (4: masked images, 1: mask)
 # pipe_inpaint = StableDiffusionInpaintPipeline.from_pretrained(
 #     "runwayml/stable-diffusion-inpainting",
 #     revision="fp16",
@@ -36,15 +37,16 @@ content_mask = None  # Provide the content mask M
 
 # Encode the prompt
 ### seed
-prompt = "two men in front of the building"
+prompt = "two men in front of the building" # 1. original caption 2. editing caption (w/ ca) 3. only ca
 ca = "men"  # Provide the focal content ca
 text_input = tokenizer(prompt, return_tensors="pt", padding="max_length", truncation=True, max_length=77)
 text_embeddings = text_encoder(text_input.input_ids.to("cuda"))[0].to(torch.float16)
 
 # Parameters
 N = 100
-T = torch.linspace(0, scheduler.config.num_train_timesteps - 1, steps=10).long()
-# T = torch.randint(low=0, high=scheduler.config.num_train_timesteps - 1, size=(10,)).long()
+# T = torch.linspace(0, scheduler.config.num_train_timesteps - 1, steps=10).long()
+T = torch.randint(low=0, high=scheduler.config.num_train_timesteps - 1, size=(10,)).long()
+# TODO: not uniform sampling => transfer to weighted (annealing-like) sampling 
 epsilon = 0.06
 alpha = 0.01
 threshold = 0.5
@@ -58,17 +60,21 @@ for n in trange(N):
     all_grad = torch.zeros_like(adv_image).to("cuda")
     all_loss = 0
     for t in T:
+        # TODO: experiment to mask image first and make attention map
+        ### adv_image = content_mask * adv_image 
+
+        adv_image = adv_image.to(torch.float16)
         adv_image.requires_grad = True
-        noise = torch.randn_like(adv_image).to("cuda")
-        adv_image = scheduler.add_noise(adv_image, noise, t).to(torch.float16)
         
         # Forward pass
         latents = vae.encode(adv_image).latent_dist.sample()
+        noise = torch.randn_like(latents).to("cuda")
+        latents = scheduler.add_noise(latents, noise, t)
         latents = latents * vae.config.scaling_factor
-        
+
         noise_pred = unet(latents, t, encoder_hidden_states=text_embeddings)["sample"]
-        # if (n == 0 or n == N-1):
-        #     save_by_timesteps(tokenizer, prompt, height, width, f'attention_{n}')
+        if (n == 0 or n == N-1):
+            save_by_timesteps(tokenizer, prompt, height, width, f'attention_{n}')
         attn_maps = get_average_attn_map(tokenizer, prompt, ca, height, width)
 
         if content_mask == None:
@@ -90,7 +96,7 @@ for n in trange(N):
     print(all_loss)
     # Update adv_image
     all_grad /= len(T)
-    adv_image = adv_image.detach() - alpha * all_grad.sign() ### loss 看起來沒有往下 => 先把content mask印出來
+    adv_image = adv_image.detach() - alpha * all_grad.sign()
     delta = torch.clamp(adv_image - init_image, min=-epsilon, max=epsilon)
     adv_image = torch.clamp(init_image + delta, min=0, max=1).detach()
 
